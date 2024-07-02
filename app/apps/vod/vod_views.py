@@ -26,6 +26,7 @@ from common import deps
 from core.logger import logger
 from core.constants import BASE_DIR
 from utils.path import get_api_path, get_file_text, get_file_modified_time, get_now
+from utils.tools import get_md5
 from dateutil.relativedelta import relativedelta
 from pathlib import Path
 import sys
@@ -38,6 +39,8 @@ api_url = ''
 API_STORE = {
 
 }
+# 扩展储存同api分发不同ext扩展的上限。超过这个上限清空储存
+API_DICT_LIMIT = 5
 
 
 # u: Users = Depends(deps.user_perm([f"{access_name}:get"]))
@@ -86,6 +89,10 @@ def vod_generate(*, api: str = "", request: Request,
     # 如果传了nocache就会清除缓存
     nocache = getParams('nocache')
 
+    api_ext = getParams('api_ext')  # t4初始化api的扩展参数
+    extend = getParams('extend')  # t4初始化配置里的ext参数
+    extend = extend or api_ext
+
     # 判断head请求但不是本地代理直接干掉
     # if req_method == 'head' and (t4_api + '&') not in whole_url:
     if req_method == 'head' and not is_proxy:
@@ -111,29 +118,51 @@ def vod_generate(*, api: str = "", request: Request,
         del API_STORE[api]
 
     try:
+        extend_store = get_md5(extend) if extend else extend
         api_path = get_api_path(api)
         api_time = get_file_modified_time(api_path)
         api_store_lists = list(API_STORE.keys())
         if api not in api_store_lists:
             # 没初始化过，需要初始化
             need_init = True
+            # 设为空字典
+            API_STORE[api] = {}
         else:
-            _api = API_STORE[api] or {'time': None}
-            _api_time = _api['time']
-            # 内存储存时间 < 文件修改时间 需要重新初始化
-            if not _api_time or _api_time < api_time or (_api_time + relativedelta(seconds=_seconds) < get_now()):
+            _api_dict = API_STORE[api] or {}
+            _apis = _api_dict.keys()
+            # 超过字典扩展分发储存限制自动清空并且要求重新初始化
+            if len(_apis) > API_DICT_LIMIT:
+                logger.info(f'源路径:{api_path}疑似被恶意加载扩展，超过扩展分发数量{API_DICT_LIMIT}，现在清空储存器')
+                # 初始化过，但是扩展数量超过上限。防止恶意无限刷扩展，删了
                 need_init = True
+                del API_STORE[api]
+                # 设为空字典
+                API_STORE[api] = {}
+            else:
+                # 防止储存类型不是字典
+                if not isinstance(API_STORE[api], dict):
+                    # 设为空字典
+                    API_STORE[api] = {}
+
+                # _api = API_STORE[api] or {'time': None}
+                # 取拓展里的
+                _api = API_STORE[api].get(extend_store) or {'time': None}
+                _api_time = _api['time']
+                # 内存储存时间 < 文件修改时间 需要重新初始化
+                if not _api_time or _api_time < api_time or (_api_time + relativedelta(seconds=_seconds) < get_now()):
+                    need_init = True
 
         if need_init:
-            logger.info(f'需要初始化源:源路径:{api_path},源最后修改时间:{api_time}')
+            logger.info(f'需要初始化源:源路径:{api_path},扩展:{extend_store},源最后修改时间:{api_time}')
             if is_drpy:
                 vod = Drpy(api, t4_js_api, debug)
             else:
                 vod = Vod(api=api, query_params=request.query_params, t4_api=t4_api).module
             # 记录初始化时间|下次文件修改后判断储存的时间 < 文件修改时间又会重新初始化
-            API_STORE[api] = {'vod': vod, 'time': get_now()}
+            # API_STORE[api] = {'vod': vod, 'time': get_now()}
+            API_STORE[api][extend_store] = {'vod': vod, 'time': get_now()}
         else:
-            vod = API_STORE[api]['vod']
+            vod = API_STORE[api][extend_store]['vod']
 
     except Exception as e:
         return respErrorJson(error_code.ERROR_INTERNAL.set_msg(f"内部服务器错误:{e}"))
@@ -142,8 +171,6 @@ def vod_generate(*, api: str = "", request: Request,
     ids = getParams('ids')
     filters = getParams('f')  # t1 筛选 {'cid':'1'}
     ext = getParams('ext')  # t4筛选传入base64加密的json字符串
-    api_ext = getParams('api_ext')  # t4初始化api的扩展参数
-    extend = getParams('extend')  # t4初始化配置里的ext参数
     filterable = getParams('filter')  # t4能否筛选
     if req_method == 'post':  # t4 ext网络数据太长会自动post,此时强制可筛选
         filterable = True
@@ -160,8 +187,6 @@ def vod_generate(*, api: str = "", request: Request,
     ad_url = getParams('url')
     ad_headers = getParams('headers')
     ad_name = getParams('name') or 'm3u8'
-
-    extend = extend or api_ext
 
     if is_drpy:
         vod.setDebug(debug)
@@ -336,6 +361,12 @@ def vod_generate(*, api: str = "", request: Request,
         try:
             id_list = ids.split(',')
             data = vod.detailContent(id_list)
+            try:
+                _type = vod.getRule('类型')
+                data.update({"type": _type})
+            except Exception as e:
+                if is_drpy:
+                    logger.error(f'二级尝试获取源类型发生错误:{e}')
             return respVodJson(data)
         except Exception as e:
             error_msg = f"detailContent执行发生内部服务器错误:{e}"
@@ -352,6 +383,12 @@ def vod_generate(*, api: str = "", request: Request,
 
     home_data = vod.homeContent(filterable) or {}
     home_video_data = vod.homeVideoContent() or {}
+    try:
+        _type = vod.getRule('类型')
+        home_data.update({"type": _type})
+    except Exception as e:
+        if is_drpy:
+            logger.error(f'首页尝试获取源类型发生错误:{e}')
     home_data.update(home_video_data)
 
     if debug:
